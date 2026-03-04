@@ -52,6 +52,7 @@ pub fn decode_wsl_output(bytes: &[u8]) -> String {
 /// Returns `true` when `name` is a valid WSL distro identifier.
 ///
 /// Allowed characters: ASCII alphanumeric, `-`, `_`, `.`; max length 64.
+/// Additional security: rejects shell special characters to prevent command injection.
 #[cfg(target_os = "windows")]
 pub fn is_valid_wsl_distro_name(name: &str) -> bool {
     !name.is_empty()
@@ -59,9 +60,23 @@ pub fn is_valid_wsl_distro_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        // Security: reject shell special characters that could lead to command injection
+        && !name.contains('`')
+        && !name.contains('$')
+        && !name.contains('&')
+        && !name.contains('|')
+        && !name.contains(';')
+        && !name.contains('<')
+        && !name.contains('>')
+        && !name.contains('(')
+        && !name.contains(')')
 }
 
 // ─── Distro enumeration ─────────────────────────────────────────────────────
+
+/// Maximum number of WSL distros to process (prevents resource exhaustion).
+#[cfg(target_os = "windows")]
+const MAX_WSL_DISTROS: usize = 20;
 
 /// Return all installed WSL distros, excluding docker-desktop entries and
 /// entries with invalid names.  Returns an empty `Vec` when WSL is not
@@ -80,7 +95,8 @@ pub fn get_all_wsl_distros() -> Vec<String> {
     };
 
     let text = decode_wsl_output(&output.stdout);
-    text.lines()
+    let distros: Vec<String> = text
+        .lines()
         .map(|line| {
             line.trim()
                 .trim_matches('\u{feff}') // BOM
@@ -91,7 +107,19 @@ pub fn get_all_wsl_distros() -> Vec<String> {
         .filter(|line| !line.starts_with('*'))
         .filter(|line| is_valid_wsl_distro_name(line))
         .filter(|line| !line.to_ascii_lowercase().contains("docker"))
-        .collect()
+        .collect();
+
+    // Limit the number of distros to prevent resource exhaustion
+    if distros.len() > MAX_WSL_DISTROS {
+        log::warn!(
+            "Found {} WSL distros, limiting to {}",
+            distros.len(),
+            MAX_WSL_DISTROS
+        );
+        distros.into_iter().take(MAX_WSL_DISTROS).collect()
+    } else {
+        distros
+    }
 }
 
 // ─── UNC path helpers ───────────────────────────────────────────────────────

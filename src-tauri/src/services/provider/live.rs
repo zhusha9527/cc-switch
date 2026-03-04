@@ -23,6 +23,29 @@ use super::gemini_auth::{
 };
 use super::normalize_claude_models_in_value;
 
+/// Result of multi-path write operation, containing failed secondary paths.
+pub struct MultiPathResult {
+    pub failed_secondary_paths: Vec<PathBuf>,
+}
+
+impl MultiPathResult {
+    pub fn new() -> Self {
+        Self {
+            failed_secondary_paths: Vec::new(),
+        }
+    }
+
+    pub fn is_complete_success(&self) -> bool {
+        self.failed_secondary_paths.is_empty()
+    }
+}
+
+impl Default for MultiPathResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub(crate) fn sanitize_claude_settings_for_live(settings: &Value) -> Value {
     let mut v = settings.clone();
     if let Some(obj) = v.as_object_mut() {
@@ -35,11 +58,11 @@ pub(crate) fn sanitize_claude_settings_for_live(settings: &Value) -> Value {
     v
 }
 
-fn for_each_claude_settings_path<F>(mut op: F) -> Result<(), AppError>
+fn for_each_claude_settings_path<F>(mut op: F) -> Result<MultiPathResult, AppError>
 where
     F: FnMut(usize, &Path) -> Result<(), AppError>,
 {
-    
+    let mut result = MultiPathResult::new();
     let mut paths = get_claude_settings_paths();
     log::debug!("Claude settings paths: {:?}", paths);
     if paths.is_empty() {
@@ -56,15 +79,17 @@ where
                 path.display(),
                 err
             );
+            result.failed_secondary_paths.push(path.to_path_buf());
         }
     }
-    Ok(())
+    Ok(result)
 }
 
-fn for_each_codex_live_path<F>(mut op: F) -> Result<(), AppError>
+fn for_each_codex_live_path<F>(mut op: F) -> Result<MultiPathResult, AppError>
 where
     F: FnMut(usize, &Path, &Path) -> Result<(), AppError>,
 {
+    let mut result = MultiPathResult::new();
     let auth_primary = get_codex_auth_path();
     let primary_dir = auth_primary
         .parent()
@@ -85,15 +110,17 @@ where
                 dir.display(),
                 err
             );
+            result.failed_secondary_paths.push(dir.to_path_buf());
         }
     }
-    Ok(())
+    Ok(result)
 }
 
-fn for_each_gemini_live_path<F>(mut op: F) -> Result<(), AppError>
+fn for_each_gemini_live_path<F>(mut op: F) -> Result<MultiPathResult, AppError>
 where
     F: FnMut(usize, &Path, &Path) -> Result<(), AppError>,
 {
+    let mut result = MultiPathResult::new();
     let env_primary = crate::gemini_config::get_gemini_env_path();
     let primary_dir = env_primary
         .parent()
@@ -114,15 +141,17 @@ where
                 dir.display(),
                 err
             );
+            result.failed_secondary_paths.push(dir.to_path_buf());
         }
     }
-    Ok(())
+    Ok(result)
 }
 
-fn for_each_opencode_config_path<F>(mut op: F) -> Result<(), AppError>
+fn for_each_opencode_config_path<F>(mut op: F) -> Result<MultiPathResult, AppError>
 where
     F: FnMut(usize, &Path) -> Result<(), AppError>,
 {
+    let mut result = MultiPathResult::new();
     let primary_path = crate::opencode_config::get_opencode_config_path();
     let primary_dir = primary_path
         .parent()
@@ -142,15 +171,17 @@ where
                 path.display(),
                 err
             );
+            result.failed_secondary_paths.push(path.to_path_buf());
         }
     }
-    Ok(())
+    Ok(result)
 }
 
-fn for_each_openclaw_config_path<F>(mut op: F) -> Result<(), AppError>
+fn for_each_openclaw_config_path<F>(mut op: F) -> Result<MultiPathResult, AppError>
 where
     F: FnMut(usize, &Path) -> Result<(), AppError>,
 {
+    let mut result = MultiPathResult::new();
     let primary_path = crate::openclaw_config::get_openclaw_config_path();
     let primary_dir = primary_path
         .parent()
@@ -170,9 +201,10 @@ where
                 path.display(),
                 err
             );
+            result.failed_secondary_paths.push(path.to_path_buf());
         }
     }
-    Ok(())
+    Ok(result)
 }
 
 fn write_gemini_env_at(env_path: &Path, env_map: &HashMap<String, String>) -> Result<(), AppError> {
@@ -344,7 +376,7 @@ impl LiveSnapshot {
     pub(crate) fn restore(&self) -> Result<(), AppError> {
         match self {
             LiveSnapshot::Claude { settings } => {
-                for_each_claude_settings_path(|_, path| {
+                let result = for_each_claude_settings_path(|_, path| {
                     if let Some(value) = settings {
                         write_json_file(path, value)?;
                     } else if path.exists() {
@@ -352,9 +384,15 @@ impl LiveSnapshot {
                     }
                     Ok(())
                 })?;
+                if !result.is_complete_success() {
+                    log::warn!(
+                        "Claude settings restore completed with {} failed secondary paths",
+                        result.failed_secondary_paths.len()
+                    );
+                }
             }
             LiveSnapshot::Codex { auth, config } => {
-                for_each_codex_live_path(|_, auth_path, config_path| {
+                let result = for_each_codex_live_path(|_, auth_path, config_path| {
                     if let Some(value) = auth {
                         write_json_file(auth_path, value)?;
                     } else if auth_path.exists() {
@@ -368,9 +406,15 @@ impl LiveSnapshot {
                     }
                     Ok(())
                 })?;
+                if !result.is_complete_success() {
+                    log::warn!(
+                        "Codex settings restore completed with {} failed secondary paths",
+                        result.failed_secondary_paths.len()
+                    );
+                }
             }
             LiveSnapshot::Gemini { env, .. } => {
-                for_each_gemini_live_path(|_, env_path, settings_path| {
+                let result = for_each_gemini_live_path(|_, env_path, settings_path| {
                     if let Some(env_map) = env {
                         write_gemini_env_at(env_path, env_map)?;
                     } else if env_path.exists() {
@@ -390,6 +434,15 @@ impl LiveSnapshot {
                     }
                     Ok(())
                 })?;
+                if !result.is_complete_success() {
+                    log::warn!(
+                        "Gemini settings restore completed with {} failed secondary paths",
+                        result.failed_secondary_paths.len()
+                    );
+                }
+            }
+                    Ok(())
+                })?;
             }
         }
         Ok(())
@@ -401,7 +454,13 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
     match app_type {
         AppType::Claude => {
             let settings = sanitize_claude_settings_for_live(&provider.settings_config);
-            for_each_claude_settings_path(|_, path| write_json_file(path, &settings))?;
+            let result = for_each_claude_settings_path(|_, path| write_json_file(path, &settings))?;
+            if !result.is_complete_success() {
+                log::warn!(
+                    "Claude live snapshot written with {} failed secondary paths",
+                    result.failed_secondary_paths.len()
+                );
+            }
         }
         AppType::Codex => {
             let obj = provider
@@ -415,10 +474,16 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
                 AppError::Config("Codex 供应商配置缺少 'config' 字段或不是字符串".to_string())
             })?;
 
-            for_each_codex_live_path(|_, auth_path, config_path| {
+            let result = for_each_codex_live_path(|_, auth_path, config_path| {
                 write_json_file(auth_path, auth)?;
                 std::fs::write(config_path, config_str).map_err(|e| AppError::io(config_path, e))
             })?;
+            if !result.is_complete_success() {
+                log::warn!(
+                    "Codex live snapshot written with {} failed secondary paths",
+                    result.failed_secondary_paths.len()
+                );
+            }
         }
         AppType::Gemini => {
             // Delegate to write_gemini_live which handles env file writing correctly
@@ -455,9 +520,16 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
                 Ok(config) => {
                     let value = serde_json::to_value(&config)
                         .map_err(|e| AppError::JsonSerialize { source: e })?;
-                    for_each_opencode_config_path(|_, path| {
+                    let result = for_each_opencode_config_path(|_, path| {
                         upsert_opencode_provider_at(path, &provider.id, value.clone())
                     })?;
+                    if !result.is_complete_success() {
+                        log::warn!(
+                            "OpenCode provider '{}' written with {} failed secondary paths",
+                            provider.id,
+                            result.failed_secondary_paths.len()
+                        );
+                    }
                     log::info!("OpenCode provider '{}' written to live config", provider.id);
                 }
                 Err(e) => {
@@ -470,9 +542,16 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
                     if config_to_write.get("npm").is_some()
                         || config_to_write.get("options").is_some()
                     {
-                        for_each_opencode_config_path(|_, path| {
+                        let result = for_each_opencode_config_path(|_, path| {
                             upsert_opencode_provider_at(path, &provider.id, config_to_write.clone())
                         })?;
+                        if !result.is_complete_success() {
+                            log::warn!(
+                                "OpenCode provider '{}' written as raw JSON with {} failed secondary paths",
+                                provider.id,
+                                result.failed_secondary_paths.len()
+                            );
+                        }
                         log::info!(
                             "OpenCode provider '{}' written as raw JSON to live config",
                             provider.id
@@ -497,9 +576,16 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
                 Ok(config) => {
                     let value = serde_json::to_value(&config)
                         .map_err(|e| AppError::JsonSerialize { source: e })?;
-                    for_each_openclaw_config_path(|_, path| {
+                    let result = for_each_openclaw_config_path(|_, path| {
                         upsert_openclaw_provider_at(path, &provider.id, value.clone())
                     })?;
+                    if !result.is_complete_success() {
+                        log::warn!(
+                            "OpenClaw provider '{}' written with {} failed secondary paths",
+                            provider.id,
+                            result.failed_secondary_paths.len()
+                        );
+                    }
                     log::info!("OpenClaw provider '{}' written to live config", provider.id);
                 }
                 Err(e) => {
@@ -513,13 +599,20 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
                         || provider.settings_config.get("api").is_some()
                         || provider.settings_config.get("models").is_some()
                     {
-                        for_each_openclaw_config_path(|_, path| {
+                        let result = for_each_openclaw_config_path(|_, path| {
                             upsert_openclaw_provider_at(
                                 path,
                                 &provider.id,
                                 provider.settings_config.clone(),
                             )
                         })?;
+                        if !result.is_complete_success() {
+                            log::warn!(
+                                "OpenClaw provider '{}' written as raw JSON with {} failed secondary paths",
+                                provider.id,
+                                result.failed_secondary_paths.len()
+                            );
+                        }
                         log::info!(
                             "OpenClaw provider '{}' written as raw JSON to live config",
                             provider.id
@@ -631,7 +724,7 @@ pub(crate) fn write_live_partial(app_type: &AppType, provider: &Provider) -> Res
 /// Used for user-level preferences (attribution, thinking, etc.) that are
 /// independent of the active provider.
 pub fn patch_claude_live(patch: Value) -> Result<(), AppError> {
-    for_each_claude_settings_path(|_, path| {
+    let result = for_each_claude_settings_path(|_, path| {
         let mut live = if path.exists() {
             read_json_file(path).unwrap_or_else(|_| json!({}))
         } else {
@@ -641,6 +734,12 @@ pub fn patch_claude_live(patch: Value) -> Result<(), AppError> {
         let settings = sanitize_claude_settings_for_live(&live);
         write_json_file(path, &settings)
     })?;
+    if !result.is_complete_success() {
+        log::warn!(
+            "Claude live patch applied with {} failed secondary paths",
+            result.failed_secondary_paths.len()
+        );
+    }
     Ok(())
 }
 
@@ -670,7 +769,7 @@ fn json_merge_patch(target: &mut Value, patch: &Value) {
 
 /// Claude: merge only key env and top-level fields into live settings.json
 fn write_claude_live_partial(provider: &Provider) -> Result<(), AppError> {
-    for_each_claude_settings_path(|_, path| {
+    let result = for_each_claude_settings_path(|_, path| {
         // 1. Read existing live config (start from empty if file doesn't exist)
         let mut live = if path.exists() {
             read_json_file(path).unwrap_or_else(|_| json!({}))
@@ -720,6 +819,12 @@ fn write_claude_live_partial(provider: &Provider) -> Result<(), AppError> {
         let settings = sanitize_claude_settings_for_live(&live);
         write_json_file(path, &settings)
     })?;
+    if !result.is_complete_success() {
+        log::warn!(
+            "Claude live partial written with {} failed secondary paths",
+            result.failed_secondary_paths.len()
+        );
+    }
     Ok(())
 }
 
@@ -737,7 +842,7 @@ fn write_codex_live_partial(provider: &Provider) -> Result<(), AppError> {
 
     let provider_config_str = obj.get("config").and_then(|v| v.as_str()).unwrap_or("");
 
-    for_each_codex_live_path(|_, auth_path, config_path| {
+    let result = for_each_codex_live_path(|_, auth_path, config_path| {
         let existing_toml = if config_path.exists() {
             std::fs::read_to_string(config_path).unwrap_or_default()
         } else {
@@ -773,6 +878,12 @@ fn write_codex_live_partial(provider: &Provider) -> Result<(), AppError> {
         write_json_file(auth_path, auth)?;
         crate::config::write_text_file(config_path, &live_doc.to_string())
     })?;
+    if !result.is_complete_success() {
+        log::warn!(
+            "Codex live partial written with {} failed secondary paths",
+            result.failed_secondary_paths.len()
+        );
+    }
     Ok(())
 }
 
@@ -780,7 +891,7 @@ fn write_codex_live_partial(provider: &Provider) -> Result<(), AppError> {
 fn write_gemini_live_partial(provider: &Provider) -> Result<(), AppError> {
     let auth_type = detect_gemini_auth_type(provider);
 
-    for_each_gemini_live_path(|_, env_path, settings_path| {
+    let result = for_each_gemini_live_path(|_, env_path, settings_path| {
         let mut env_map = if env_path.exists() {
             std::fs::read_to_string(env_path)
                 .ok()
@@ -845,7 +956,12 @@ fn write_gemini_live_partial(provider: &Provider) -> Result<(), AppError> {
 
         set_gemini_selected_type_at(settings_path, &auth_type)
     })?;
-
+    if !result.is_complete_success() {
+        log::warn!(
+            "Gemini live partial written with {} failed secondary paths",
+            result.failed_secondary_paths.len()
+        );
+    }
     Ok(())
 }
 
@@ -1225,7 +1341,7 @@ pub(crate) fn write_gemini_live(provider: &Provider) -> Result<(), AppError> {
 
     let env_map = json_to_env(&provider.settings_config)?;
 
-    for_each_gemini_live_path(|_, env_path, settings_path| {
+    let result = for_each_gemini_live_path(|_, env_path, settings_path| {
         let mut local_env_map = env_map.clone();
 
         let mut config_to_write: Option<Value> = None;
@@ -1276,6 +1392,12 @@ pub(crate) fn write_gemini_live(provider: &Provider) -> Result<(), AppError> {
 
         set_gemini_selected_type_at(settings_path, &auth_type)
     })?;
+    if !result.is_complete_success() {
+        log::warn!(
+            "Gemini live config written with {} failed secondary paths",
+            result.failed_secondary_paths.len()
+        );
+    }
 
     Ok(())
 }
@@ -1285,7 +1407,14 @@ pub(crate) fn write_gemini_live(provider: &Provider) -> Result<(), AppError> {
 /// This is specific to OpenCode's additive mode - removing a provider
 /// from the opencode.json file.
 pub(crate) fn remove_opencode_provider_from_live(provider_id: &str) -> Result<(), AppError> {
-    for_each_opencode_config_path(|_, path| remove_opencode_provider_at(path, provider_id))?;
+    let result = for_each_opencode_config_path(|_, path| remove_opencode_provider_at(path, provider_id))?;
+    if !result.is_complete_success() {
+        log::warn!(
+            "OpenCode provider '{}' removal completed with {} failed secondary paths",
+            provider_id,
+            result.failed_secondary_paths.len()
+        );
+    }
     log::info!("OpenCode provider '{provider_id}' removed from live config");
 
     Ok(())
@@ -1414,7 +1543,14 @@ pub fn import_openclaw_providers_from_live(state: &AppState) -> Result<usize, Ap
 /// This removes a specific provider from ~/.openclaw/openclaw.json
 /// without affecting other providers in the file.
 pub fn remove_openclaw_provider_from_live(provider_id: &str) -> Result<(), AppError> {
-    for_each_openclaw_config_path(|_, path| remove_openclaw_provider_at(path, provider_id))?;
+    let result = for_each_openclaw_config_path(|_, path| remove_openclaw_provider_at(path, provider_id))?;
+    if !result.is_complete_success() {
+        log::warn!(
+            "OpenClaw provider '{}' removal completed with {} failed secondary paths",
+            provider_id,
+            result.failed_secondary_paths.len()
+        );
+    }
     log::info!("OpenClaw provider '{provider_id}' removed from live config");
 
     Ok(())
